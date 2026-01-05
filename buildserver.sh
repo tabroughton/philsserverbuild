@@ -47,6 +47,7 @@ HARDEN_SSH="true"
 DOCKER_LOG_MAX_SIZE="10m"
 DOCKER_LOG_MAX_FILE="3"
 
+
 # ---- Helpers ----
 log() { echo -e "\n\033[1;32m==>\033[0m $*"; }
 warn() { echo -e "\n\033[1;33m==>\033[0m $*"; }
@@ -84,6 +85,21 @@ has_admin_ssh_key() {
   [[ -n "$home_dir" && -f "${home_dir}/.ssh/authorized_keys" && -s "${home_dir}/.ssh/authorized_keys" ]]
 }
 
+apt_install_if_missing() {
+  # Installs packages only if they are not already installed.
+  # Usage: apt_install_if_missing pkg1 pkg2 ...
+  local to_install=()
+  for pkg in "$@"; do
+    if dpkg -s "$pkg" >/dev/null 2>&1; then
+      continue
+    fi
+    to_install+=("$pkg")
+  done
+  if (( ${#to_install[@]} > 0 )); then
+    apt-get install -y "${to_install[@]}"
+  fi
+}
+
 # ---- Start ----
 require_root
 detect_debian
@@ -100,25 +116,27 @@ hostnamectl set-hostname "${HOSTNAME}"
 
 log "Updating apt and installing base packages"
 apt-get update -y
-apt-get install -y ca-certificates curl gnupg lsb-release apt-transport-https ufw
+apt_install_if_missing ca-certificates curl gnupg lsb-release apt-transport-https ufw
 
 log "Installing Avahi for mDNS (.local) hostname discovery"
-apt-get install -y avahi-daemon
+apt_install_if_missing avahi-daemon
 systemctl enable --now avahi-daemon
 
 # ---- Docker install (official repo) ----
-log "Installing Docker Engine using Docker's official repo"
+log "Installing Docker Engine using Docker's official repo (idempotent)"
 install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-chmod a+r /etc/apt/keyrings/docker.gpg
 
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
-  ${VERSION_CODENAME} stable" \
-  > /etc/apt/sources.list.d/docker.list
+if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
+  curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+fi
+
+cat > /etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian ${VERSION_CODENAME} stable
+EOF
 
 apt-get update -y
-apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+apt_install_if_missing docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
 log "Enabling Docker"
 systemctl enable --now docker
@@ -139,14 +157,14 @@ cat > /etc/docker/daemon.json <<JSON
 JSON
 systemctl restart docker
 
-# ---- Cockpit + Firewall GUI ----
-log "Installing Cockpit (host web admin) + Cockpit firewall UI"
-apt-get install -y cockpit cockpit-firewall
+# ---- Cockpit ----
+log "Installing Cockpit (host web admin)"
+apt_install_if_missing cockpit
 systemctl enable --now cockpit.socket
 
 # ---- Unattended upgrades ----
 log "Installing and enabling unattended upgrades (automatic security updates)"
-apt-get install -y unattended-upgrades
+apt_install_if_missing unattended-upgrades
 dpkg-reconfigure -f noninteractive unattended-upgrades >/dev/null 2>&1 || true
 
 UA_CONF="/etc/apt/apt.conf.d/50unattended-upgrades"
@@ -169,7 +187,7 @@ systemctl enable --now apt-daily.timer apt-daily-upgrade.timer || true
 
 # ---- Fail2ban ----
 log "Installing and enabling Fail2ban (SSH brute-force protection)"
-apt-get install -y fail2ban
+apt_install_if_missing fail2ban
 systemctl enable --now fail2ban
 
 cat > /etc/fail2ban/jail.d/sshd.local <<'CONF'
@@ -215,8 +233,8 @@ if [[ "${HARDEN_SSH}" == "true" ]]; then
 fi
 
 # ---- Deploy Portainer CE ----
-log "Deploying Portainer CE"
-docker volume create "${PORTAINER_VOL}" >/dev/null
+log "Deploying Portainer CE (idempotent)"
+docker volume create "${PORTAINER_VOL}" >/dev/null 2>&1 || true
 
 docker rm -f portainer >/dev/null 2>&1 || true
 docker run -d \
@@ -230,7 +248,7 @@ docker run -d \
   portainer/portainer-ce:latest
 
 # ---- Deploy Dockge ----
-log "Deploying Dockge"
+log "Deploying Dockge (idempotent)"
 mkdir -p "${STACKS_DIR}"
 mkdir -p "${DOCKGE_DIR}"
 
@@ -253,7 +271,7 @@ docker compose -f "${DOCKGE_DIR}/compose.yml" up -d
 
 # ---- Firewall (UFW) ----
 log "Configuring UFW firewall (LAN-only management access)"
-
+# Safe to re-run: we reset and re-apply the baseline rules.
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
@@ -287,10 +305,8 @@ echo "  Cockpit:   https://${HOSTNAME}.local:${COCKPIT_PORT}  (or https://${IP_H
 echo "  Portainer: https://${HOSTNAME}.local:${PORTAINER_HTTPS_PORT}"
 echo "  Dockge:    http://${HOSTNAME}.local:${DOCKGE_PORT}"
 echo
-echo "Firewall GUI:"
-echo "  In Cockpit: Networking → Firewall"
-echo
 echo "Notes:"
 echo " - Docker control == root-equivalent; keep Docker CLI to admin via sudo."
 echo " - Put Compose stacks in: ${STACKS_DIR} (Dockge watches this)."
+echo " - Add public ports later with: sudo ufw allow <port>/<proto>"
 echo "------------------------------------------------------------"
