@@ -10,148 +10,238 @@ set -euo pipefail
 # - hardening, firewalld and fail2ban		 #
 # - this script can be run multiple times	 #
 # - see output at end of script for further info #
-##################################################
 
-require_root() {
-  [[ "$(id -u)" -eq 0 ]] || { echo "Run with sudo"; exit 1; }
+
+# ---------------- USER SETTINGS ----------------
+TIMEZONE="Europe/London"
+LAN_CIDR="192.168.4.0/24"
+
+ADMIN_USER="philadmin"
+
+PORTAINER_HTTPS_PORT="9443"
+COCKPIT_PORT="9090"
+
+PORTAINER_VOL="portainer_data"
+
+AUTO_REBOOT="true"
+AUTO_REBOOT_TIME="03:30"
+
+HARDEN_SSH="true"
+
+DOCKER_LOG_MAX_SIZE="10m"
+DOCKER_LOG_MAX_FILE="3"
+# ------------------------------------------------
+
+# ---------------- Helpers ----------------
+log()  { echo -e "\n\033[1;32m==>\033[0m $*"; }
+warn() { echo -e "\n\033[1;33m==>\033[0m $*"; }
+die()  { echo -e "\n\033[1;31mERROR:\033[0m $*"; exit 1; }
+
+require_root() { [[ "$(id -u)" -eq 0 ]] || die "Run with sudo"; }
+
+detect_debian() {
+  source /etc/os-release || die "Cannot detect OS"
+  [[ "$ID" == "debian" ]] || die "Debian only"
 }
 
+apt_install_if_missing() {
+  local pkgs=()
+  for p in "$@"; do dpkg -s "$p" >/dev/null 2>&1 || pkgs+=("$p"); done
+  [[ ${#pkgs[@]} -eq 0 ]] || apt-get install -y "${pkgs[@]}"
+}
+
+detect_lan_iface() {
+  ip route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'
+}
+# ------------------------------------------------
+
 require_root
+detect_debian
 
-echo "Detecting IPv4 addresses..."
+LAN_IFACE="$(detect_lan_iface)"
+[[ -n "$LAN_IFACE" ]] || die "Could not detect LAN interface"
 
-mapfile -t IPS < <(
-  ip -o -4 addr show scope global | awk '{print $2, $4}'
-)
+# ---------------- Base system ----------------
+log "Setting timezone"
+timedatectl set-timezone "$TIMEZONE" || true
 
-[[ ${#IPS[@]} -gt 0 ]] || { echo "No IPv4 addresses found"; exit 1; }
+log "Updating base packages"
+apt-get update -y
+apt_install_if_missing ca-certificates curl gnupg lsb-release apt-transport-https
 
-echo
-echo "Select the LAN IP to base the configuration on:"
-i=1
-for entry in "${IPS[@]}"; do
-  iface="${entry%% *}"
-  cidr="${entry##* }"
-  ip="${cidr%%/*}"
-  echo "  [$i] $iface  →  $ip/$cidr"
-  ((i++))
-done
+# ---------------- Firewall: firewalld ----------------
+log "Replacing UFW with firewalld"
 
-echo
-read -rp "Enter number: " choice
-(( choice >= 1 && choice <= ${#IPS[@]} )) || { echo "Invalid choice"; exit 1; }
+if dpkg -s ufw >/dev/null 2>&1; then
+  systemctl stop ufw || true
+  systemctl disable ufw || true
+  ufw --force disable || true
+  apt-get purge -y ufw || true
+  apt-get autoremove -y || true
+fi
 
-SELECTED="${IPS[$((choice-1))]}"
-LAN_IFACE="${SELECTED%% *}"
-LAN_CIDR_FULL="${SELECTED##* }"
-LAN_IP="${LAN_CIDR_FULL%%/*}"
-LAN_PREFIX="${LAN_CIDR_FULL##*/}"
+apt_install_if_missing firewalld
+systemctl enable --now firewalld
 
-echo
-echo "Selected:"
-echo "  Interface : $LAN_IFACE"
-echo "  IP        : $LAN_IP"
-echo "  CIDR      : $LAN_IP/$LAN_PREFIX"
+# ---------------- Docker ----------------
+log "Installing Docker"
 
-# ------------------------------------------------------------
-# Infer subnet (network address)
-# ------------------------------------------------------------
-LAN_SUBNET="$(ipcalc -n "$LAN_CIDR_FULL" | awk -F= '/NETWORK/ {print $2}')/$LAN_PREFIX"
+install -d /etc/apt/keyrings
+if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
+  curl -fsSL https://download.docker.com/linux/debian/gpg | \
+    gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+fi
 
-echo "  Subnet    : $LAN_SUBNET"
-echo
+cat > /etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/debian ${VERSION_CODENAME} stable
+EOF
 
-read -rp "Proceed with updating system to this LAN? [y/N]: " confirm
-[[ "$confirm" =~ ^[Yy]$ ]] || exit 0
+apt-get update -y
+apt_install_if_missing docker-ce docker-ce-cli containerd.io docker-compose-plugin
 
-# ------------------------------------------------------------
-# firewalld: update home zone source
-# ------------------------------------------------------------
-echo
-echo "Updating firewalld home zone..."
+# Ensure firewalld starts before Docker
+install -d /etc/systemd/system/docker.service.d
+cat > /etc/systemd/system/docker.service.d/10-firewalld.conf <<EOF
+[Unit]
+Requires=firewalld.service
+After=firewalld.service
+EOF
 
-# Remove old home sources
-mapfile -t OLD_SOURCES < <(
-  firewall-cmd --permanent --zone=home --list-sources
-)
+systemctl daemon-reload
 
-for src in "${OLD_SOURCES[@]}"; do
-  [[ -n "$src" ]] && firewall-cmd --permanent --zone=home --remove-source="$src"
-done
+mkdir -p /etc/docker
+cat > /etc/docker/daemon.json <<EOF
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "$DOCKER_LOG_MAX_SIZE",
+    "max-file": "$DOCKER_LOG_MAX_FILE"
+  }
+}
+EOF
 
-firewall-cmd --permanent --zone=home --add-source="$LAN_SUBNET"
+systemctl enable --now docker
+systemctl restart docker
 
-# ------------------------------------------------------------
-# firewalld: update DOCKER-USER rules
-# ------------------------------------------------------------
-echo
-echo "Updating DOCKER-USER rules..."
+# ---------------- Cockpit ----------------
+log "Installing Cockpit"
+apt_install_if_missing cockpit
+systemctl enable --now cockpit.socket
 
-mapfile -t RULES < <(
-  firewall-cmd --permanent --direct --get-all-rules | grep 'DOCKER-USER' || true
-)
+# ---------------- Fail2ban ----------------
+log "Installing Fail2ban"
+apt_install_if_missing fail2ban
+systemctl enable --now fail2ban
 
-for rule in "${RULES[@]}"; do
-  firewall-cmd --permanent --direct --remove-rule $rule || true
-done
+cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+[sshd]
+enabled = true
+maxretry = 5
+findtime = 10m
+bantime = 1h
+EOF
+systemctl restart fail2ban
 
-# Re-add baseline rules with new iface/CIDR
+# ---------------- SSH hardening ----------------
+if [[ "$HARDEN_SSH" == "true" ]]; then
+  log "Hardening SSH"
+  sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+  systemctl restart ssh || true
+fi
+
+# ---------------- Portainer ----------------
+log "Deploying Portainer"
+docker volume create "$PORTAINER_VOL" >/dev/null 2>&1 || true
+docker rm -f portainer >/dev/null 2>&1 || true
+
+docker run -d \
+  --name portainer \
+  --restart=always \
+  -p "$PORTAINER_HTTPS_PORT:9443" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$PORTAINER_VOL:/data" \
+  portainer/portainer-ce:latest
+
+# ---------------- firewalld rules ----------------
+log "Configuring firewalld zones"
+
+firewall-cmd --permanent --set-default-zone=public
+firewall-cmd --permanent --zone=home --add-source="$LAN_CIDR" || true
+
+firewall-cmd --permanent --zone=home --add-port=22/tcp || true
+firewall-cmd --permanent --zone=home --add-port="$COCKPIT_PORT"/tcp || true
+firewall-cmd --permanent --zone=home --add-port="$PORTAINER_HTTPS_PORT"/tcp || true
+
+# Docker LAN-only policy (DOCKER-USER)
 firewall-cmd --permanent --direct --add-rule ipv4 filter DOCKER-USER 0 \
-  -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+  -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN || true
 
 firewall-cmd --permanent --direct --add-rule ipv4 filter DOCKER-USER 1 \
-  -i docker0 -j RETURN
+  -i docker0 -j RETURN || true
 firewall-cmd --permanent --direct --add-rule ipv4 filter DOCKER-USER 1 \
-  -i br+ -j RETURN
+  -i br+ -j RETURN || true
 
 firewall-cmd --permanent --direct --add-rule ipv4 filter DOCKER-USER 2 \
-  -i "$LAN_IFACE" -s "$LAN_SUBNET" -o docker0 -j RETURN
+  -i "$LAN_IFACE" -s "$LAN_CIDR" -o docker0 -j RETURN || true
 firewall-cmd --permanent --direct --add-rule ipv4 filter DOCKER-USER 2 \
-  -i "$LAN_IFACE" -s "$LAN_SUBNET" -o br+ -j RETURN
+  -i "$LAN_IFACE" -s "$LAN_CIDR" -o br+ -j RETURN || true
 
 firewall-cmd --permanent --direct --add-rule ipv4 filter DOCKER-USER 10 \
-  -i "$LAN_IFACE" -o docker0 -j DROP
+  -i "$LAN_IFACE" -o docker0 -j DROP || true
 firewall-cmd --permanent --direct --add-rule ipv4 filter DOCKER-USER 10 \
-  -i "$LAN_IFACE" -o br+ -j DROP
+  -i "$LAN_IFACE" -o br+ -j DROP || true
 
-# ------------------------------------------------------------
-# Update Docker containers bound to old LAN IPs
-# ------------------------------------------------------------
-echo
-echo "Scanning containers for old LAN IP bindings..."
-
-mapfile -t CONTAINERS < <(docker ps -q)
-
-for c in "${CONTAINERS[@]}"; do
-  mapfile -t BINDS < <(
-    docker inspect "$c" \
-      --format '{{range .HostConfig.PortBindings}}{{range .}}{{.HostIp}}{{end}}{{end}}'
-  )
-
-  for ip in "${BINDS[@]}"; do
-    [[ "$ip" == "0.0.0.0" || -z "$ip" ]] && continue
-    [[ "$ip" == "$LAN_IP" ]] && continue
-
-    echo
-    echo "Container $c is bound to old IP $ip"
-    echo "You must recreate this container to bind to $LAN_IP"
-    echo "Skipping automatic change (Docker limitation)."
-  done
-done
-
-# ------------------------------------------------------------
-# Apply firewall changes
-# ------------------------------------------------------------
 firewall-cmd --reload
 
-echo
-echo "✔ LAN network update complete"
-echo
-echo "Summary:"
-echo "  Interface : $LAN_IFACE"
-echo "  IP        : $LAN_IP"
-echo "  Subnet    : $LAN_SUBNET"
-echo
-echo "NOTE:"
-echo "- Containers bound to old IPs must be recreated"
-echo "- Containers bound to 0.0.0.0 are unaffected"
+# ---------------- README ----------------
+log "Writing firewall README"
+cat > /opt/README-firewall.md <<EOF
+# Docker + firewalld quick guide
+
+## A) LAN-only container (default)
+
+In Portainer:
+- Publish port
+- Host IP: <SERVER_LAN_IP>
+- Host Port / Container Port: as needed
+
+Result:
+- LAN access only
+- No firewall changes needed
+
+---
+
+## B) LAN + Public container
+
+### 1) Portainer
+- Host IP: 0.0.0.0
+- Publish port normally
+
+### 2) Host firewall
+Example (TCP 8080):
+
+sudo firewall-cmd --permanent --direct \\
+  --add-rule ipv4 filter DOCKER-USER 3 \\
+  -i $LAN_IFACE -o docker0 -p tcp --dport 8080 -j RETURN
+
+sudo firewall-cmd --permanent --direct \\
+  --add-rule ipv4 filter DOCKER-USER 3 \\
+  -i $LAN_IFACE -o br+ -p tcp --dport 8080 -j RETURN
+
+sudo firewall-cmd --reload
+
+### 3) Router
+Forward the same port to this host.
+EOF
+
+# ---------------- Done ----------------
+IP="$(hostname -I | awk '{print $1}')"
+
+log "Bootstrap complete"
+echo "------------------------------------------------------------"
+echo "Cockpit:   https://$IP:$COCKPIT_PORT"
+echo "Portainer: https://$IP:$PORTAINER_HTTPS_PORT"
+echo "Firewall notes: /opt/README-firewall.md"
+echo "------------------------------------------------------------"
