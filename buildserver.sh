@@ -11,6 +11,9 @@ set -euo pipefail
 # - firewalld for host ports (LAN-only)
 # - Docker published ports LAN-only by default
 #   (enforced via DOCKER-USER using systemd after docker starts)
+# - DuckDNS updater (philshomeserver.duckdns.org)
+#   * token stored in /etc/duckdns.env as DUCKDNS_TOKEN
+#   * updater ONLY runs if DUCKDNS_TOKEN is set (otherwise it exits cleanly)
 #
 # Safe to re-run.
 ##################################################
@@ -30,6 +33,10 @@ HARDEN_SSH="true"
 
 DOCKER_LOG_MAX_SIZE="10m"
 DOCKER_LOG_MAX_FILE="3"
+
+# DuckDNS settings
+DUCKDNS_DOMAIN="philshomeserver"        # philshomeserver.duckdns.org
+DUCKDNS_ENV_FILE="/etc/duckdns.env"     # contains DUCKDNS_TOKEN=...
 # ------------------------------------------------
 
 # ---------------- Helpers ----------------
@@ -231,9 +238,145 @@ systemctl daemon-reload
 systemctl enable --now docker-lan-only.service
 systemctl restart docker-lan-only.service
 
-# ---------------- README ----------------
-log "Writing firewall README"
+# ---------------- DuckDNS (philshomeserver.duckdns.org) ----------------
+log "Installing DuckDNS updater (only runs if DUCKDNS_TOKEN is set)"
+
+# 1) Create an environment file template (DO NOT write the token into this script)
+if [[ ! -f "$DUCKDNS_ENV_FILE" ]]; then
+  cat > "$DUCKDNS_ENV_FILE" <<'EOF'
+# DuckDNS token env file
+# 1) Get your token from https://duckdns.org
+# 2) Put it here as:
+#    DUCKDNS_TOKEN=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+#
+# IMPORTANT:
+# - Keep this file readable only by root:
+#   sudo chmod 600 /etc/duckdns.env
+# - The updater will NO-OP (exit 0) if DUCKDNS_TOKEN is missing or empty.
+DUCKDNS_TOKEN=
+EOF
+  chmod 600 "$DUCKDNS_ENV_FILE"
+  chown root:root "$DUCKDNS_ENV_FILE"
+fi
+
+# 2) Install updater script
+cat > /usr/local/sbin/duckdns-update.sh <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="${DUCKDNS_DOMAIN}"
+ENV_FILE="${DUCKDNS_ENV_FILE}"
+
+STATE_DIR="/var/lib/duckdns"
+STATE_FILE="\${STATE_DIR}/last_ip"
+LOG_FILE="/var/log/duckdns.log"
+
+# Load token if file exists (don't fail the system if it doesn't)
+if [[ -f "\$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "\$ENV_FILE"
+fi
+
+# Only run if DUCKDNS_TOKEN is available/set
+if [[ -z "\${DUCKDNS_TOKEN:-}" ]]; then
+  # No token => no-op (requested behavior)
+  exit 0
+fi
+
+# Determine current public IPv4
+IP="\$(curl -fsS --max-time 10 https://api.ipify.org | tr -d ' \\n\\r\\t')"
+
+mkdir -p "\$STATE_DIR"
+touch "\$LOG_FILE"
+chmod 600 "\$LOG_FILE" || true
+
+LAST_IP=""
+[[ -f "\$STATE_FILE" ]] && LAST_IP="\$(cat "\$STATE_FILE" || true)"
+
+if [[ "\$IP" == "\$LAST_IP" ]]; then
+  echo "\$(date -Is) DuckDNS: IP unchanged (\$IP)" >> "\$LOG_FILE"
+  exit 0
+fi
+
+URL="https://www.duckdns.org/update?domains=\${DOMAIN}&token=\${DUCKDNS_TOKEN}&ip=\${IP}"
+RESPONSE="\$(curl -fsS --max-time 20 "\$URL")"
+
+if [[ "\$RESPONSE" == "OK" ]]; then
+  echo -n "\$IP" > "\$STATE_FILE"
+  chmod 600 "\$STATE_FILE" || true
+  echo "\$(date -Is) DuckDNS: updated \${DOMAIN}.duckdns.org: \${LAST_IP:-<none>} -> \$IP" >> "\$LOG_FILE"
+else
+  echo "\$(date -Is) DuckDNS: update FAILED: \$RESPONSE" >> "\$LOG_FILE"
+  exit 1
+fi
+EOF
+chmod 750 /usr/local/sbin/duckdns-update.sh
+chown root:root /usr/local/sbin/duckdns-update.sh
+
+# 3) systemd service + timer (enabled by default; updater no-ops until token is set)
+cat > /etc/systemd/system/duckdns.service <<EOF
+[Unit]
+Description=DuckDNS updater (${DUCKDNS_DOMAIN}.duckdns.org)
+
+[Service]
+Type=oneshot
+EnvironmentFile=${DUCKDNS_ENV_FILE}
+ExecStart=/usr/local/sbin/duckdns-update.sh
+EOF
+
+cat > /etc/systemd/system/duckdns.timer <<'EOF'
+[Unit]
+Description=Run DuckDNS updater every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now duckdns.timer >/dev/null 2>&1 || true
+
+# 4) Write README with instructions
 install -d /opt
+cat > /opt/README-duckdns.md <<EOF
+# DuckDNS (${DUCKDNS_DOMAIN}.duckdns.org)
+
+This server installs a DuckDNS updater that runs every 5 minutes via systemd timer.
+
+## Configure your token (required)
+1) Get your token from https://duckdns.org
+2) Edit:
+   ${DUCKDNS_ENV_FILE}
+
+Set:
+   DUCKDNS_TOKEN=YOUR_TOKEN_HERE
+
+Then secure it (should already be 600, but safe to re-apply):
+   sudo chmod 600 ${DUCKDNS_ENV_FILE}
+   sudo chown root:root ${DUCKDNS_ENV_FILE}
+
+## Important behavior
+- The updater ONLY runs if DUCKDNS_TOKEN is set (non-empty).
+- If DUCKDNS_TOKEN is missing/empty, the updater exits successfully (no-op).
+
+## Manual run / troubleshooting
+Run once:
+   sudo /usr/local/sbin/duckdns-update.sh
+
+Check logs:
+   sudo tail -n 50 /var/log/duckdns.log
+
+Check timer + recent runs:
+   systemctl list-timers | grep duckdns
+   journalctl -u duckdns.service --no-pager -n 50
+EOF
+
+# ---------------- README (firewall) ----------------
+log "Writing firewall README"
 cat > /opt/README-firewall.md <<EOF
 # Docker + firewalld quick guide
 
@@ -266,6 +409,7 @@ echo "------------------------------------------------------------"
 echo "Cockpit:   https://$IP:$COCKPIT_PORT   (LAN-only)"
 echo "Portainer: https://$IP:$PORTAINER_HTTPS_PORT   (LAN-only)"
 echo "Firewall notes: /opt/README-firewall.md"
+echo "DuckDNS notes:  /opt/README-duckdns.md"
 echo "LAN interface detected: $LAN_IFACE"
 echo "LAN CIDR configured: $LAN_CIDR"
 echo "------------------------------------------------------------"

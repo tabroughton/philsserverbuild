@@ -40,6 +40,11 @@ The goal is to provide a *safe default posture* where:
 - Cockpit (host management UI)
 - Portainer (container management UI)
 
+** DNS for internet access (if needed)
+- duckdns.org
+- you need to copy =./duckdns.env.template= to =/etc/duckdns.env=
+- set the token in =/etc/duckdns.env=
+  
 * Firewall Model (Important)
 
 This server uses a *two-layer firewall model*:
