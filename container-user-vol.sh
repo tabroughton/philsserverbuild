@@ -49,6 +49,7 @@ ensure_user() {
     info "Creating user: $user"
     # system user, no home, no login
     useradd --system --no-create-home --shell /usr/sbin/nologin "$user"
+	echo "Created container user:"; id "$user"
   fi
 }
 
@@ -183,3 +184,4 @@ main() {
 }
 
 main "$@"
+
