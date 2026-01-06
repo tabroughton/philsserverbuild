@@ -1,0 +1,114 @@
+#+TITLE: Server Bootstrap Script
+#+AUTHOR: tabroughton
+#+OPTIONS: toc:t num:nil
+
+* Purpose / Intention
+
+This script bootstraps a *secure, repeatable Docker host* suitable for:
+
+- Game servers
+- Long-lived services
+- Headless home / small-office servers
+- Multi-server environments where consistency matters
+
+The goal is to provide a *safe default posture* where:
+
+- The host is locked down
+- Docker containers are *LAN-only by default*
+- Public exposure is always explicit and intentional
+- The system can be rebuilt or re-run without surprises
+
+* What This Script Sets Up
+
+** Base system
+- Timezone configuration
+- Package updates
+- Common prerequisites
+
+** Security
+- firewalld (replaces UFW)
+- fail2ban (SSH protection)
+- Basic SSH hardening (no root login)
+
+** Docker
+- Docker Engine (official repository)
+- Docker starts *after* firewalld
+- Log rotation configured
+- Deterministic firewall behavior
+
+** Management
+- Cockpit (host management UI)
+- Portainer (container management UI)
+
+* Firewall Model (Important)
+
+This server uses a *two-layer firewall model*:
+
+** firewalld (zones)
+Used for:
+- Host services (SSH, Cockpit, Portainer)
+- LAN vs public separation
+- Managed via Cockpit
+
+** DOCKER-USER (iptables)
+Used for:
+- Enforcing *LAN-only by default* for Docker containers
+- Preventing accidental public exposure
+- Acting as the final gate before container traffic
+
+These layers intentionally serve *different purposes*.
+
+* Default Network Behavior
+
+- Host services:
+  - Accessible only from the LAN
+- Docker containers:
+  - Published ports are *LAN-only by default*
+  - Public access requires an explicit rule
+
+Nothing becomes public “by accident”.
+
+* Idempotency / Re-runs
+
+This script is designed to be:
+
+- Safe to re-run
+- Non-destructive
+- Deterministic
+
+If the script fails partway through:
+- Fix the issue
+- Re-run the script
+- Existing configuration is reused where possible
+
+No rollback or rebuild is required.
+
+* What This Script Does NOT Do
+
+- It does not create application containers
+- It does not expose any container ports publicly
+- It does not manage DNS or hostnames
+- It does not assume any specific workloads
+
+Those decisions are intentionally left to later steps.
+
+* Typical Workflow
+
+1. Run this script on a fresh server
+2. Verify access to:
+   - Cockpit (LAN)
+   - Portainer (LAN)
+3. Prepare container volumes
+4. Create containers in Portainer
+5. Explicitly expose public services *only when needed*
+
+* Summary
+
+This bootstrap script establishes:
+
+- A hardened baseline
+- Clear separation of concerns
+- Predictable networking behavior
+- A foundation suitable for game servers and services
+
+It is intentionally conservative by design.

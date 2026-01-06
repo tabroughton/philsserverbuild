@@ -1,0 +1,157 @@
+#+TITLE: container-vols.sh — Container Volume Preparation
+#+AUTHOR: tabroughton
+#+OPTIONS: toc:t num:nil
+
+* Purpose / Intention
+
+This script provides a *consistent, repeatable way* to prepare host directories
+(“volumes”) for Docker containers *before* the containers are created.
+
+It enforces the following principles:
+
+- Each container gets its *own dedicated system user*
+- Container data lives in *one predictable location*
+- File ownership and permissions are *explicit and safe*
+- No accidental mixing of data between containers
+- Easy cleanup when a container is retired
+
+This is especially useful for:
+
+- Game servers
+- Long-lived stateful containers
+- Multi-server setups where consistency matters
+
+* Design Summary
+
+- *Base path:* =/opt/containers/<container-name>/=
+- *User:* =container_<container-name>= (system user, no login)
+- *Ownership:* All directories owned by that user
+- *Permissions:*
+  - Directories: =rwx= for container user, =rx= for group, none for others
+  - Execute (=x=) is required on directories so the container can access files
+- *Idempotent:* Safe to re-run =create= / =add=
+
+* Commands
+
+** create
+Creates the container user (if missing) and one or more directories.
+
+#+BEGIN_SRC bash
+sudo ./container-vols.sh create <container-name> <dir1> [dir2 ...]
+#+END_SRC
+
+If the user or directories already exist, they are *left in place* and permissions
+are enforced.
+
+** add
+Adds additional directories to an existing container.
+
+#+BEGIN_SRC bash
+sudo ./container-vols.sh add <container-name> <dir1> [dir2 ...]
+#+END_SRC
+
+Functionally equivalent to =create=, but semantically clearer when extending an
+existing setup.
+
+** remove
+Removes *specific directories* for a container.  
+Prompts for confirmation.
+
+#+BEGIN_SRC bash
+sudo ./container-vols.sh remove <container-name> <dir1> [dir2 ...]
+#+END_SRC
+
+Only the listed directories are removed.  
+The container root directory and user remain.
+
+** delete
+Removes *everything* for a container:
+
+- All directories under =/opt/containers/<container-name>/=
+- The container user
+
+Prompts for confirmation.
+
+#+BEGIN_SRC bash
+sudo ./container-vols.sh delete <container-name>
+#+END_SRC
+
+Use this when a container is permanently retired.
+
+* Examples
+
+** Prepare volumes for a Valheim server
+
+#+BEGIN_SRC bash
+sudo ./container-vols.sh create valheim config data backups
+#+END_SRC
+
+Creates:
+
+#+BEGIN_EXAMPLE
+/opt/containers/valheim/
+├── config/
+├── data/
+└── backups/
+#+END_EXAMPLE
+
+User:
+
+#+BEGIN_EXAMPLE
+container_valheim
+#+END_EXAMPLE
+
+** Add a logs directory later
+
+#+BEGIN_SRC bash
+sudo ./container-vols.sh add valheim logs
+#+END_SRC
+
+** Remove one directory
+
+#+BEGIN_SRC bash
+sudo ./container-vols.sh remove valheim backups
+#+END_SRC
+
+(Confirmation required)
+
+** Remove everything for the container
+
+#+BEGIN_SRC bash
+sudo ./container-vols.sh delete valheim
+#+END_SRC
+
+(Confirmation required)
+
+* Using with Portainer / Docker
+
+When creating a container, bind-mount volumes like:
+
+#+BEGIN_EXAMPLE
+Host path: /opt/containers/valheim/data
+Container path: /data
+#+END_EXAMPLE
+
+Run the container as:
+
+- the default user inside the container, or
+- explicitly map UID/GID if the image supports it
+
+* Notes
+
+- Directory execute (=x=) permission is required for access; without it, files
+  inside cannot be read or written.
+- This script does *not* create Docker containers — it only prepares the
+  filesystem safely.
+- Container names are sanitized for use in usernames and paths.
+
+* Summary
+
+This script exists to:
+
+- Reduce mistakes
+- Make container data predictable
+- Make cleanup safe and deliberate
+- Support repeatable multi-server setups
+
+It is intentionally conservative and explicit by design.

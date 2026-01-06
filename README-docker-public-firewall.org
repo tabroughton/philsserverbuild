@@ -1,0 +1,132 @@
+#+TITLE: Docker Public Firewall Rules
+#+AUTHOR: tabroughton
+#+OPTIONS: toc:t num:nil
+
+* Purpose / Intention
+
+These scripts provide a *controlled, auditable way* to expose Docker container
+ports to the public network.
+
+They exist to solve a specific problem:
+
+- Docker publishes ports automatically
+- firewalld zone rules do not reliably control container forwarding
+- Accidental exposure is easy without an explicit gate
+
+The solution used here is the =DOCKER-USER= iptables chain.
+
+* Design Principles
+
+- Containers are *LAN-only by default*
+- Public access must be explicit
+- Rules must persist across reboot
+- Rules must be easy to audit and remove
+- No dependency on container IDs or runtime state
+
+* Components
+
+** make-docker-public.sh
+Creates public firewall exceptions for a container.
+
+- Accepts a container name (reference only)
+- Accepts one or more =port/protocol= pairs
+- Generates:
+  - A firewall rules script
+  - A systemd oneshot service
+- Applies rules immediately
+- Ensures rules run on every boot
+
+** remove-docker-public.sh
+Removes all public firewall rules for a container.
+
+- Takes only the container name
+- Stops and disables the service
+- Removes iptables rules
+- Deletes associated files
+- Prompts for confirmation
+
+** list-docker-public.sh
+Audits all managed public container rules.
+
+- Lists container references
+- Shows ports/protocols
+- Shows service enable/active state
+
+* How the Firewall Logic Works
+
+- Docker publishes ports as usual
+- The baseline policy *drops non-LAN traffic* to containers
+- Public rules insert =RETURN= rules *above* the drops
+- Ordering ensures:
+  - LAN access always works
+  - Public access is allowed only when explicitly configured
+
+firewalld zones are *not* used for container exposure.
+
+* Usage Examples
+
+** Make a container public (example: Valheim)
+
+#+BEGIN_SRC bash
+sudo make-docker-public.sh valheim 2456/udp 2457/udp 2458/udp
+#+END_SRC
+
+Effect:
+- UDP ports 2456–2458 become publicly reachable
+- Rules persist across reboot
+
+** Remove public access
+
+#+BEGIN_SRC bash
+sudo remove-docker-public.sh valheim
+#+END_SRC
+
+All public firewall rules for that container are removed.
+
+** List public containers
+
+#+BEGIN_SRC bash
+sudo list-docker-public.sh
+#+END_SRC
+
+Displays all containers with public firewall exceptions.
+
+* Relationship to Portainer
+
+- Portainer is used to create and manage containers
+- Portainer does *not* control firewall exposure
+- These scripts intentionally separate:
+  - “Container exists”
+  - “Container is public”
+
+This avoids accidental exposure.
+
+* Relationship to firewalld / Cockpit
+
+- firewalld is still used for host services
+- Cockpit can manage host firewall rules
+- Container exposure is *outside* the zone model by design
+
+This keeps responsibilities clear and auditable.
+
+* When to Use These Scripts
+
+Use these scripts when:
+- Exposing game servers (UDP/TCP)
+- Exposing services that cannot sit behind a reverse proxy
+- You want explicit, reviewable exposure
+
+Do NOT use them for:
+- Internal-only services
+- Web apps that can be proxied behind a single public endpoint
+
+* Summary
+
+These scripts provide:
+
+- Explicit container exposure
+- Persistent, reboot-safe rules
+- Easy auditing and cleanup
+- A safer alternative to Docker’s default behavior
+
+They are intentionally explicit and conservative by design.
