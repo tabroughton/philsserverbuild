@@ -8,8 +8,7 @@ set -euo pipefail
 # - cockpit for server management
 # - portainer for containers
 # - hardening, firewalld and fail2ban
-# - this script can be run multiple times
-# - see output at end of script for further info
+# - script is safe to re-run
 ##################################################
 
 # ---------------- USER SETTINGS ----------------
@@ -23,9 +22,6 @@ COCKPIT_PORT="9090"
 
 PORTAINER_VOL="portainer_data"
 
-AUTO_REBOOT="true"
-AUTO_REBOOT_TIME="03:30"
-
 HARDEN_SSH="true"
 
 DOCKER_LOG_MAX_SIZE="10m"
@@ -34,7 +30,6 @@ DOCKER_LOG_MAX_FILE="3"
 
 # ---------------- Helpers ----------------
 log()  { echo -e "\n\033[1;32m==>\033[0m $*"; }
-warn() { echo -e "\n\033[1;33m==>\033[0m $*"; }
 die()  { echo -e "\n\033[1;31mERROR:\033[0m $*"; exit 1; }
 
 require_root() { [[ "$(id -u)" -eq 0 ]] || die "Run with sudo"; }
@@ -51,19 +46,7 @@ apt_install_if_missing() {
 }
 
 detect_lan_iface() {
-  ip route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}'
-}
-
-fw_add_port_home_once() {
-  local portproto="$1"
-  firewall-cmd --permanent --zone=home --query-port="$portproto" >/dev/null 2>&1 \
-    || firewall-cmd --permanent --zone=home --add-port="$portproto" >/dev/null
-}
-
-fw_add_source_home_once() {
-  local cidr="$1"
-  firewall-cmd --permanent --zone=home --query-source="$cidr" >/dev/null 2>&1 \
-    || firewall-cmd --permanent --zone=home --add-source="$cidr" >/dev/null
+  ip route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
 }
 # ------------------------------------------------
 
@@ -175,45 +158,38 @@ docker run -d \
   portainer/portainer-ce:latest
 
 # ---------------- firewalld rules ----------------
-log "Configuring firewalld zones"
+log "Configuring firewalld (runtime → permanent)"
 
-firewall-cmd --permanent --set-default-zone=public >/dev/null
+# Runtime rules ONLY
+firewall-cmd --set-default-zone=public || true
+firewall-cmd --zone=home --add-source="$LAN_CIDR" || true
 
-fw_add_source_home_once "$LAN_CIDR"
+firewall-cmd --zone=home --add-port=22/tcp || true
+firewall-cmd --zone=home --add-port="${COCKPIT_PORT}/tcp" || true
+firewall-cmd --zone=home --add-port="${PORTAINER_HTTPS_PORT}/tcp" || true
 
-fw_add_port_home_once "22/tcp"
-fw_add_port_home_once "${COCKPIT_PORT}/tcp"
-fw_add_port_home_once "${PORTAINER_HTTPS_PORT}/tcp"
+# Docker LAN-only policy (runtime)
+firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 10 \
+  -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN || true
 
-# Persist DOCKER-USER policy via /etc/firewalld/direct.xml
-log "Persisting Docker LAN-only policy in /etc/firewalld/direct.xml"
+firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 11 \
+  -i docker0 -j RETURN || true
+firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 11 \
+  -i br+ -j RETURN || true
 
-install -d /etc/firewalld
+firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 12 \
+  -i "$LAN_IFACE" -s "$LAN_CIDR" -o docker0 -j RETURN || true
+firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 12 \
+  -i "$LAN_IFACE" -s "$LAN_CIDR" -o br+ -j RETURN || true
 
-cat > /etc/firewalld/direct.xml <<EOF
-<?xml version="1.0" encoding="utf-8"?>
-<direct>
-  <!-- Script-owned rules (LAN-only by default). Manual rules: use priority >= 30. -->
+firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 19 \
+  -i "$LAN_IFACE" -o docker0 -j DROP || true
+firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 19 \
+  -i "$LAN_IFACE" -o br+ -j DROP || true
 
-  <!-- Allow established/related -->
-  <rule ipv="ipv4" table="filter" chain="DOCKER-USER" priority="10">-m conntrack --ctstate RELATED,ESTABLISHED -j RETURN</rule>
-
-  <!-- Allow traffic originating from docker bridges (egress / bridge traffic) -->
-  <rule ipv="ipv4" table="filter" chain="DOCKER-USER" priority="11">-i docker0 -j RETURN</rule>
-  <rule ipv="ipv4" table="filter" chain="DOCKER-USER" priority="11">-i br+ -j RETURN</rule>
-
-  <!-- Allow LAN to reach published container ports (forwarded to docker bridges) -->
-  <rule ipv="ipv4" table="filter" chain="DOCKER-USER" priority="12">-i ${LAN_IFACE} -s ${LAN_CIDR} -o docker0 -j RETURN</rule>
-  <rule ipv="ipv4" table="filter" chain="DOCKER-USER" priority="12">-i ${LAN_IFACE} -s ${LAN_CIDR} -o br+ -j RETURN</rule>
-
-  <!-- Drop non-LAN attempting to reach containers via published ports -->
-  <rule ipv="ipv4" table="filter" chain="DOCKER-USER" priority="19">-i ${LAN_IFACE} -o docker0 -j DROP</rule>
-  <rule ipv="ipv4" table="filter" chain="DOCKER-USER" priority="19">-i ${LAN_IFACE} -o br+ -j DROP</rule>
-</direct>
-EOF
-
-# Reload firewalld to apply direct.xml + permanent changes
-firewall-cmd --reload >/dev/null
+# Persist runtime rules
+firewall-cmd --runtime-to-permanent || true
+firewall-cmd --reload || true
 
 # ---------------- README ----------------
 log "Writing firewall README"
@@ -221,36 +197,20 @@ install -d /opt
 cat > /opt/README-firewall.md <<EOF
 # Docker + firewalld quick guide
 
-## A) LAN-only container (default)
+## LAN-only container (default)
 In Portainer:
-- Publish port
-- Host IP: <SERVER_LAN_IP> (e.g. ${LAN_CIDR%/*}.*)
-- Host Port / Container Port: as needed
-
-Result:
-- LAN access only
-- No firewall changes needed
-
----
-
-## B) LAN + Public container
-
-### 1) Portainer
-- Host IP: 0.0.0.0
+- Host IP: server LAN IP
 - Publish port normally
 
-### 2) Host firewall (manual public exception)
-Add rules with priority >= 30 so scripts won't overwrite them.
+No firewall changes needed.
 
-Example (TCP 8080):
-sudo firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 30 -i ${LAN_IFACE} -o docker0 -p tcp --dport 8080 -j RETURN
-sudo firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 30 -i ${LAN_IFACE} -o br+    -p tcp --dport 8080 -j RETURN
-
-To make it persistent, add the same <rule> lines to /etc/firewalld/direct.xml (priority >= 30), then:
-sudo firewall-cmd --reload
-
-### 3) Router
-Forward the same port to this host.
+## Public container
+1) Portainer: Host IP = 0.0.0.0
+2) Host firewall (priority >= 30):
+   firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 30 -i ${LAN_IFACE} -o docker0 -p tcp --dport <port> -j RETURN
+   firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 30 -i ${LAN_IFACE} -o br+    -p tcp --dport <port> -j RETURN
+3) firewall-cmd --runtime-to-permanent
+4) Router port-forward
 EOF
 
 # ---------------- Done ----------------
