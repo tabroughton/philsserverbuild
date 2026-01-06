@@ -1,0 +1,121 @@
+#+TITLE: Server Build & Container Management
+#+AUTHOR: tabroughton
+#+OPTIONS: toc:t num:nil
+
+* Overview
+
+This repository / collection of scripts provides a *deliberate, security-first*
+approach to building and managing a Docker-based server, with a focus on:
+
+- Game servers
+- Long-lived stateful containers
+- Predictable networking behavior
+- Avoiding accidental public exposure
+
+Everything here is designed to be:
+
+- Explicit
+- Reproducible
+- Safe to re-run
+- Easy to audit
+
+* High-Level Design
+
+The system is built around three core ideas:
+
+1. The *host* is protected by a conventional firewall (firewalld)
+2. Docker containers are *LAN-only by default*
+3. Public exposure is always an explicit, separate action
+
+This avoids the common Docker pitfall where publishing a port immediately makes
+a service public.
+
+* Components
+
+** Server bootstrap
+Sets up the base server environment:
+
+- firewalld (host firewall)
+- Docker Engine
+- Cockpit (host management)
+- Portainer (container management)
+- fail2ban and basic SSH hardening
+
+See:
+- =README-server-bootstrap.org=
+
+** Container volume preparation
+Prepares host directories and users for containers *before* they are created:
+
+- One system user per container
+- Predictable volume layout
+- Explicit ownership and permissions
+- Safe cleanup
+
+See:
+- =README-container-vols.org=
+
+** Docker public firewall rules
+Manages public exposure of container ports:
+
+- Containers are LAN-only by default
+- Public access requires an explicit rule
+- Rules persist across reboot
+- Easy to list and remove
+
+See:
+- =README-docker-public-firewall.org=
+
+* Intended Workflow
+
+A typical workflow looks like this:
+
+1. Run the server bootstrap script on a fresh machine
+2. Verify LAN access to Cockpit and Portainer
+3. Prepare container volumes using =container-vols.sh=
+4. Create containers in Portainer
+5. If (and only if) needed, expose container ports using the firewall scripts
+
+Each step is intentionally separate.
+
+* Firewall Model (Summary)
+
+- *firewalld zones*:
+  - Protect host services
+  - Managed via Cockpit
+- *DOCKER-USER (iptables)*:
+  - Enforces LAN-only policy for containers
+  - Acts as the final gate for container traffic
+
+These layers serve different purposes and are not interchangeable.
+
+* What This Setup Optimizes For
+
+- Predictability over convenience
+- Explicit intent over implicit behavior
+- Auditability over automation
+- Safety over speed
+
+This is especially suitable for game servers and other services where exposing a
+port has real consequences.
+
+* What This Setup Does Not Try To Do
+
+- It does not hide complexity behind a single UI
+- It does not automatically expose services
+- It does not assume all containers are web apps
+- It does not try to make Docker networking “magic”
+
+Those trade-offs are intentional.
+
+* Summary
+
+Taken together, these scripts provide:
+
+- A hardened, repeatable server build
+- Clear separation of responsibilities
+- Safe container data management
+- Explicit, reviewable public exposure
+
+The result is a Docker host that behaves *the same way every time* and only does
+what you explicitly tell it to do.
