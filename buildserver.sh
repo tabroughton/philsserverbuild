@@ -4,11 +4,15 @@ set -euo pipefail
 ##################################################
 # build script for phils server
 #
-# - debian os
-# - cockpit for server management
-# - portainer for containers
-# - hardening, firewalld and fail2ban
-# - script is safe to re-run
+# - Debian
+# - Cockpit
+# - Portainer
+# - fail2ban + basic SSH hardening
+# - firewalld for host ports (LAN-only)
+# - Docker published ports LAN-only by default
+#   (enforced via DOCKER-USER using systemd after docker starts)
+#
+# Safe to re-run.
 ##################################################
 
 # ---------------- USER SETTINGS ----------------
@@ -30,6 +34,7 @@ DOCKER_LOG_MAX_FILE="3"
 
 # ---------------- Helpers ----------------
 log()  { echo -e "\n\033[1;32m==>\033[0m $*"; }
+warn() { echo -e "\n\033[1;33m==>\033[0m $*"; }
 die()  { echo -e "\n\033[1;31mERROR:\033[0m $*"; exit 1; }
 
 require_root() { [[ "$(id -u)" -eq 0 ]] || die "Run with sudo"; }
@@ -79,7 +84,7 @@ apt_install_if_missing firewalld
 systemctl enable --now firewalld
 
 # ---------------- Docker ----------------
-log "Installing Docker"
+log "Installing Docker (official repo)"
 
 install -d /etc/apt/keyrings
 if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
@@ -93,7 +98,7 @@ deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] h
 EOF
 
 apt-get update -y
-apt_install_if_missing docker-ce docker-ce-cli containerd.io docker-compose-plugin
+apt_install_if_missing docker-ce docker-ce-cli containerd.io docker-compose-plugin iptables
 
 # Ensure firewalld starts before Docker
 install -d /etc/systemd/system/docker.service.d
@@ -104,6 +109,7 @@ After=firewalld.service
 EOF
 systemctl daemon-reload
 
+log "Configuring Docker log rotation"
 mkdir -p /etc/docker
 cat > /etc/docker/daemon.json <<EOF
 {
@@ -157,10 +163,10 @@ docker run -d \
   -v "$PORTAINER_VOL:/data" \
   portainer/portainer-ce:latest
 
-# ---------------- firewalld rules ----------------
-log "Configuring firewalld (runtime → permanent)"
+# ---------------- firewalld rules (host ports) ----------------
+log "Configuring firewalld zones (runtime → permanent)"
 
-# Runtime rules ONLY
+# Runtime only (compatible across firewalld builds)
 firewall-cmd --set-default-zone=public || true
 firewall-cmd --zone=home --add-source="$LAN_CIDR" || true
 
@@ -168,28 +174,62 @@ firewall-cmd --zone=home --add-port=22/tcp || true
 firewall-cmd --zone=home --add-port="${COCKPIT_PORT}/tcp" || true
 firewall-cmd --zone=home --add-port="${PORTAINER_HTTPS_PORT}/tcp" || true
 
-# Docker LAN-only policy (runtime)
-firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 10 \
-  -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN || true
-
-firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 11 \
-  -i docker0 -j RETURN || true
-firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 11 \
-  -i br+ -j RETURN || true
-
-firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 12 \
-  -i "$LAN_IFACE" -s "$LAN_CIDR" -o docker0 -j RETURN || true
-firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 12 \
-  -i "$LAN_IFACE" -s "$LAN_CIDR" -o br+ -j RETURN || true
-
-firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 19 \
-  -i "$LAN_IFACE" -o docker0 -j DROP || true
-firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 19 \
-  -i "$LAN_IFACE" -o br+ -j DROP || true
-
-# Persist runtime rules
+# Persist runtime config
 firewall-cmd --runtime-to-permanent || true
 firewall-cmd --reload || true
+
+# ---------------- Docker LAN-only policy (persist + boot-safe) ----------------
+log "Installing Docker LAN-only policy service (runs after Docker starts)"
+
+install -d /usr/local/sbin
+cat > /usr/local/sbin/docker-lan-only.sh <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+LAN_IFACE="${LAN_IFACE}"
+LAN_CIDR="${LAN_CIDR}"
+
+# Ensure chain exists
+iptables -w -t filter -L DOCKER-USER >/dev/null 2>&1 || iptables -w -t filter -N DOCKER-USER
+
+# Ensure FORWARD jumps to DOCKER-USER near the top
+iptables -w -t filter -C FORWARD -j DOCKER-USER >/dev/null 2>&1 || iptables -w -t filter -I FORWARD 1 -j DOCKER-USER
+
+# Helper: add rule if missing (inserts or appends as specified)
+add_insert() { iptables -w -t filter -C DOCKER-USER "\$@" >/dev/null 2>&1 || iptables -w -t filter -I DOCKER-USER "\$@"; }
+add_append() { iptables -w -t filter -C DOCKER-USER "\$@" >/dev/null 2>&1 || iptables -w -t filter -A DOCKER-USER "\$@"; }
+
+# Script-owned rules: keep order stable
+add_insert 1 -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+add_insert 2 -i docker0 -j RETURN
+add_insert 3 -i br+ -j RETURN
+add_insert 4 -i "\$LAN_IFACE" -s "\$LAN_CIDR" -o docker0 -j RETURN
+add_insert 5 -i "\$LAN_IFACE" -s "\$LAN_CIDR" -o br+ -j RETURN
+
+# Drops go at the end so manual "public exceptions" can be inserted above them
+add_append -i "\$LAN_IFACE" -o docker0 -j DROP
+add_append -i "\$LAN_IFACE" -o br+ -j DROP
+EOF
+chmod +x /usr/local/sbin/docker-lan-only.sh
+
+cat > /etc/systemd/system/docker-lan-only.service <<'EOF'
+[Unit]
+Description=Apply LAN-only policy for Docker published ports
+Requires=firewalld.service docker.service
+After=firewalld.service docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/docker-lan-only.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now docker-lan-only.service
+systemctl restart docker-lan-only.service
 
 # ---------------- README ----------------
 log "Writing firewall README"
@@ -197,20 +237,25 @@ install -d /opt
 cat > /opt/README-firewall.md <<EOF
 # Docker + firewalld quick guide
 
-## LAN-only container (default)
+## A) LAN-only container (default)
 In Portainer:
-- Host IP: server LAN IP
-- Publish port normally
+- Publish a port and set **Host IP** to the server's LAN IP (e.g. 192.168.x.y)
+- Deploy
 
 No firewall changes needed.
 
-## Public container
+## B) LAN + Public container
 1) Portainer: Host IP = 0.0.0.0
-2) Host firewall (priority >= 30):
-   firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 30 -i ${LAN_IFACE} -o docker0 -p tcp --dport <port> -j RETURN
-   firewall-cmd --direct --add-rule ipv4 filter DOCKER-USER 30 -i ${LAN_IFACE} -o br+    -p tcp --dport <port> -j RETURN
-3) firewall-cmd --runtime-to-permanent
-4) Router port-forward
+2) Add a public exception ABOVE the DROP rules:
+
+Example (TCP 8080):
+sudo iptables -w -t filter -I DOCKER-USER 1 -i ${LAN_IFACE} -o docker0 -p tcp --dport 8080 -j RETURN
+sudo iptables -w -t filter -I DOCKER-USER 1 -i ${LAN_IFACE} -o br+    -p tcp --dport 8080 -j RETURN
+
+3) Router: port-forward to this host
+
+(If you want these public exceptions to persist across reboot, add them in a small
+systemd oneshot similar to docker-lan-only.service, or tell me and I’ll generate it.)
 EOF
 
 # ---------------- Done ----------------
@@ -218,7 +263,9 @@ IP="$(hostname -I | awk '{print $1}')"
 
 log "Bootstrap complete"
 echo "------------------------------------------------------------"
-echo "Cockpit:   https://$IP:$COCKPIT_PORT"
-echo "Portainer: https://$IP:$PORTAINER_HTTPS_PORT"
+echo "Cockpit:   https://$IP:$COCKPIT_PORT   (LAN-only)"
+echo "Portainer: https://$IP:$PORTAINER_HTTPS_PORT   (LAN-only)"
 echo "Firewall notes: /opt/README-firewall.md"
+echo "LAN interface detected: $LAN_IFACE"
+echo "LAN CIDR configured: $LAN_CIDR"
 echo "------------------------------------------------------------"
