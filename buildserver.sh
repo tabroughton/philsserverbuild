@@ -34,9 +34,10 @@ HARDEN_SSH="true"
 DOCKER_LOG_MAX_SIZE="10m"
 DOCKER_LOG_MAX_FILE="3"
 
-# DuckDNS settings
 DUCKDNS_DOMAIN="philshomeserver"        # philshomeserver.duckdns.org
 DUCKDNS_ENV_FILE="/etc/duckdns.env"     # contains DUCKDNS_TOKEN=...
+
+BACKUP_DEVICE_UUID="CHANGE-ME" #current backup SD card, will need updating
 # ------------------------------------------------
 
 # ---------------- Helpers ----------------
@@ -400,6 +401,19 @@ sudo iptables -w -t filter -I DOCKER-USER 1 -i ${LAN_IFACE} -o br+    -p tcp --d
 (If you want these public exceptions to persist across reboot, add them in a small
 systemd oneshot similar to docker-lan-only.service, or tell me and I’ll generate it.)
 EOF
+
+# ---------------- Setup backups ----------------
+# prepare the backups dir
+mkdir /backups
+groupadd backups
+chown root:backup /backups
+chmod 2770 /backups
+# add the backups device to the
+export BACKUP_DEVICE_UUID
+bash -c 'echo "UUID=$BACKUP_DEVICE_UUID  /backups  ext4  defaults,nofail  0  2" >> /etc/fstab'
+systemctl daemon-reload
+mount -a
+
 
 # ---------------- Done ----------------
 IP="$(hostname -I | awk '{print $1}')"

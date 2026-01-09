@@ -1,0 +1,107 @@
+#+TITLE: Adding a New Backup SD Card (/backups)
+#+AUTHOR:
+#+OPTIONS: toc:2
+
+* Overview
+This README describes how to prepare a new SD card and mount it consistently at =/backups= by:
+1) Partitioning the card with =fdisk=
+2) Formatting the partition with =mkfs.ext4=
+3) Identifying the correct device (e.g. =/dev/sdx= and =/dev/sdx1=)
+4) Updating =/etc/fstab= using =update-backups-device.sh=
+
+* Safety Notes
+- Be *very* sure you have the right disk. Choosing the wrong =/dev/sdX= can wipe your system drive.
+- Unmount the SD card before repartitioning/formatting it.
+- After edits to =/etc/fstab=, always test with =mount -a=.
+
+* 1) Partition the SD card using fdisk
+1. Insert the SD card.
+2. Identify the disk device (see section *3*). You want the *disk*, e.g. =/dev/sdx= (not =/dev/sdx1=).
+3. Run fdisk on the disk:
+   #+begin_src sh
+   sudo fdisk /dev/sdx
+   #+end_src
+
+4. Inside =fdisk=, create a new Linux partition (example flow):
+   - Print current table (optional):
+     - =p=
+   - Create a new partition:
+     - =n=
+   - Choose primary partition:
+     - =p=
+   - Partition number:
+     - =1=
+   - First sector:
+     - press Enter to accept default
+   - Last sector:
+     - press Enter to use entire disk (or specify a size, e.g. =+64G=)
+   - Set type to Linux (usually default is fine). If needed:
+     - =t= then choose =83= (Linux filesystem)
+   - Write changes:
+     - =w=
+
+5. Tell the kernel to re-read partition table (one of these):
+   #+begin_src sh
+   sudo partprobe /dev/sdx
+   #+end_src
+
+   Or simply unplug/replug the SD card.
+
+After this, you should have a partition like =/dev/sdx1=.
+
+* 2) Format the partition using mkfs.ext4
+Format the new partition (this erases existing data on that partition):
+#+begin_src sh
+sudo mkfs.ext4 -F /dev/sdx1
+#+end_src
+
+* 3) Find the correct device (/dev/sdx and /dev/sdx1)
+Use =lsblk= to list disks and partitions:
+#+begin_src sh
+lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS,MODEL,SERIAL
+#+end_src
+
+Tips:
+- The whole disk will appear as something like =sdx= (TYPE=disk)
+- The partition will appear as =sdx1= (TYPE=part)
+- If the SD card auto-mounted somewhere (e.g. =/media/...=), unmount it before continuing:
+  #+begin_src sh
+  sudo umount /dev/sdx1
+  #+end_src
+
+If you want to double-check the filesystem UUID:
+#+begin_src sh
+sudo blkid /dev/sdx1
+#+end_src
+
+* 4) Run the script to update /backups (update-backups-device.sh)
+This step updates the UUID used for the =/backups= mount in =/etc/fstab= based on the partition you pass in.
+
+1. Ensure mount point exists:
+   #+begin_src sh
+   sudo mkdir -p /backups
+   #+end_src
+
+2. Run the script with the *partition device* (e.g. =/dev/sdx1=):
+   #+begin_src sh
+   sudo ./update-backups-device.sh /dev/sdx1
+   #+end_src
+
+3. Validate it mounted correctly:
+   #+begin_src sh
+   findmnt /backups
+   #+end_src
+
+4. (Recommended) test fstab parsing/mounting:
+   #+begin_src sh
+   sudo umount /backups 2>/dev/null || true
+   sudo mount -a
+   findmnt /backups
+   #+end_src
+
+* Quick Checklist
+- [ ] Confirm correct disk (=lsblk=)
+- [ ] Partition created (=fdisk=) -> =/dev/sdx1=
+- [ ] Formatted (=mkfs.ext4=)
+- [ ] Script run: =sudo ./update-backups-device.sh /dev/sdx1=
+- [ ] =findmnt /backups= shows the SD card mounted at =/backups=

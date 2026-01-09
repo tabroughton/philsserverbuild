@@ -106,14 +106,6 @@ Those decisions are intentionally left to later steps.
 3. Prepare container volumes
 4. Create containers in Portainer
 5. Explicitly expose public services *only when needed*
-
-* Summary
-
-This bootstrap script establishes:
-
-- A hardened baseline
-- Clear separation of concerns
-- Predictable networking behavior
-- A foundation suitable for game servers and services
-
-It is intentionally conservative by design.
+   - note these ports and forwarding would need setting on router too
+6. Set duckdns.org (philshomeserver.duckdns.org)
+   - copy duckdns.env.template to /etc/duckdns.env and edit the token
