@@ -33,7 +33,7 @@ a service public.
 * Sever preparation
 
 1. Install Debian from USB stick
-   - Enter in wifi details
+   - Enter in wifi details (if not on ethernet)
    - Do not enter root pwd, so no root user is available
    - Create non-root user with sudo access
    - Install including mirror so apt and sources are set up, if not
@@ -108,3 +108,14 @@ Each step is intentionally separate.
 
 These layers serve different purposes and are not interchangeable.
 
+* Network
+ - On my network I have the wifi on my lan and the ethernet on a
+   different subnet isolated via opnsense
+ - I route public incomming ports via opnsense to ths ethernet address
+ - I do not want this device to access my lan in typical operation
+ 
+ - There was an issue where server is on ethernet and wifi
+ - ssh packets not being returned to ethernet address
+ - I have turned off the wifi device which has fixed it
+ - =sudo nmcli radio wifi off=
+ - =sudo systemctl disable wpa_supplicant= 
